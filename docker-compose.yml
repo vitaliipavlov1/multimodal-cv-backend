@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  # =========================
+  # Triton Inference Server
+  # =========================
+  triton:
+    image: nvcr.io/nvidia/tritonserver:23.10-py3
+    container_name: triton
+    command: >
+      tritonserver
+      --model-repository=/models
+      --grpc-port=8001
+      --http-port=8000
+      --metrics-port=8002
+    volumes:
+      - ./triton/model_repository:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    ports:
+      - "8001:8001"   # gRPC (optional, можно убрать если не нужен с хоста)
+      - "8002:8002"   # metrics для Prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+
+  # =========================
+  # Backend (FastAPI)
+  # =========================
+  backend:
+    build: ./backend
+    container_name: backend
+    depends_on:
+      triton:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      # 🔴 ВАЖНО: код монтируется → изменения подхватываются после restart
+      - ./backend/app:/app/app
+      # PaddleOCR cache
+      - paddleocr_cache:/root/.paddleocr
+    ports:
+      - "8000:8000"   # nginx проксирует сюда
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    restart: unless-stopped
+
+  # =========================
+  # Prometheus
+  # =========================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+# =========================
+# Volumes
+# =========================
+volumes:
+  paddleocr_cache:
+
