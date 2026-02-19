@@ -1,5 +1,5 @@
 # NOTE:
-# This pipeline is intentionally stream-only.
+# This pipeline is stream-only.
 
 
 import asyncio
@@ -7,10 +7,10 @@ import numpy as np
 from typing import Optional, Dict, Any, AsyncIterator, List, Callable, Awaitable
 
 # ------------------------- Modules -------------------------
-from .yolo_triton_module import YOLOv8lTritonModule
-from .yolo_pose_triton_module import YOLOv8lPoseTritonModule
-from .ocr_triton_module import PaddleOCRInferenceModule
-from .motion_farneback import FarnebackMotion
+from app.inference.yolo import YOLOv8lTritonModule
+from app.inference.yolo_pose import YOLOv8lPoseTritonModule
+from app.inference.ocr import PaddleOCRInferenceModule
+from app.inference.motion import FarnebackMotion
 
 
 def pack_flow(flow, step=16):
@@ -31,22 +31,20 @@ def pack_flow(flow, step=16):
     }
 
 
-
 # ------------------------- Async -------------------------
 
 async def run_inference_all(
-    frames_provider: Optional[Callable[[], Awaitable[Optional[np.ndarray]]]] = None,
-    use_ocr: bool = False,
-    use_yolo: bool = False,
-    use_yolo_pose: bool = False,
-    use_motion: bool = False,
-    yolo_model_name: str = "yolo",
-    pose_model_name: str = "yolo_pose",
-    yolo_triton_url: str = "triton:8001",
-    stream_id: str = "default",
+        frames_provider: Optional[Callable[[], Awaitable[Optional[np.ndarray]]]] = None,
+        batch_size: int = 1,
+        use_ocr: bool = False,
+        use_yolo: bool = False,
+        use_yolo_pose: bool = False,
+        use_motion: bool = False,
+        yolo_model_name: str = "yolo",
+        pose_model_name: str = "yolo_pose",
+        yolo_triton_url: str = "triton:8001",
+        stream_id: str = "default",
 ) -> AsyncIterator[Dict[str, Any]]:
-
-
     print(
         "[PIPELINE] run_inference_all STARTED",
         "use_yolo=", use_yolo,
@@ -54,7 +52,6 @@ async def run_inference_all(
         "use_ocr=", use_ocr,
         flush=True
     )
-
 
     # ---- setup modules ----
 
@@ -80,9 +77,7 @@ async def run_inference_all(
     if use_motion:
         motion = FarnebackMotion(stride=1)
 
-
     frame_idx = 0
-
 
     try:
         while True:
@@ -97,7 +92,7 @@ async def run_inference_all(
                     continue
 
                 if frame is None:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.03)
                     continue
 
 
@@ -105,22 +100,53 @@ async def run_inference_all(
             ocr_results = [None]
             yolo_results = [None]
             pose_results = [None]
+            tasks = {}
+            results_map = {}
 
-            #  with PIPELINE_INFER_TIME.time():
 
             if use_motion:
                 frame_flow = motion.step(frame)
 
             if use_yolo:
-                yolo_out = await yolo_module.infer_batch([frame], stream_id=stream_id)
-                yolo_results[0] = yolo_out["results"][0]
-
+                tasks["yolo"] = asyncio.create_task(
+                    yolo_module.infer_batch([frame], stream_id=stream_id)
+                )
             if use_yolo_pose:
-                pose_out = await pose_module.infer_batch([frame], stream_id=stream_id)
-                pose_results[0] = pose_out["results"][0]
+                tasks["pose"] = asyncio.create_task(
+                    pose_module.infer_batch([frame], stream_id=stream_id)
+                )
 
             if use_ocr:
-                ocr_results[0] = (await ocr_module.infer_batch([frame]))[0]
+                tasks["ocr"] = asyncio.create_task(
+                    ocr_module.infer_batch([frame])
+                )
+
+            if tasks:
+                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                results_map = dict(zip(tasks.keys(), results))
+
+            # ---------------- YOLO ----------------
+            res = results_map.get("yolo")
+            if isinstance(res, dict):
+                r = res.get("results")
+                if r and len(r) > 0 and r[0] is not None:
+                    yolo_results[0] = r[0]
+                else:
+                    yolo_results[0] = None
+
+            # ---------------- POSE ----------------
+            res = results_map.get("pose")
+            if isinstance(res, dict):
+                r = res.get("results")
+                if r and len(r) > 0 and r[0] is not None:
+                    pose_results[0] = r[0]
+                else:
+                    pose_results[0] = None
+
+            # ---------------- OCR ----------------
+            if "ocr" in results_map and not isinstance(results_map["ocr"], Exception):
+                 ocr_results[0] = results_map["ocr"][0]
+
 
             yield {
                 "batch": [{
@@ -135,12 +161,12 @@ async def run_inference_all(
             frame_idx += 1
             await asyncio.sleep(0)
 
-    
+
     finally:
         for m in [
             locals().get("yolo_module"),
             locals().get("pose_module"),
-             locals().get("ocr_module"),
+            locals().get("ocr_module"),
         ]:
             if m and hasattr(m, "close"):
                 await m.close()

@@ -7,20 +7,16 @@ import logging
 import numpy as np
 from pathlib import Path
 from uuid import uuid4
-import base64
 
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableWithMessageHistory, Runnable
-from langchain.agents import create_openai_tools_agent
-from langchain.memory import ChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
 from langchain_core.messages import AIMessageChunk
 
 from app.pipeline.multimodal import run_inference_all
@@ -39,27 +35,20 @@ logger = logging.getLogger("inference-api")
 
 DEBUG_MODE = False
 
-
 # ============================================================
 # GLOBAL STATE & CONFIGB
 # ============================================================
-
-# ---- memory / sessions ----
-memory_store: Dict[str, tuple[ChatMessageHistory, float]] = {}
-memory_lock = asyncio.Lock()
-MEMORY_TTL = 3600  # seconds
-
 
 # ---- inference / gpu ----
 inference_semaphore = asyncio.Semaphore(3)
 
 # ---- LLM backlog ----
-MAX_LLM_BACKLOG = 200   # разумный предел
+MAX_LLM_BACKLOG = 200  # reasonable limit
 
-LLM_INTERVAL_MIN = 1.0    # быстрее нельзя
-LLM_INTERVAL_MAX = 5.0    # реже нельзя
+LLM_INTERVAL_MIN = 1.0  # Shouldn't be faster
+LLM_INTERVAL_MAX = 5.0  # Shouldn't be slower
 
-BACKLOG_MAX_WAIT_SEC = 15.0   # максимум ждём backlog
+BACKLOG_MAX_WAIT_SEC = 15.0  # Max backlog waiting
 BACKLOG_CHECK_INTERVAL = 0.2
 
 # ---- active sessions (REAL, NOT prometheus) ----
@@ -67,12 +56,11 @@ active_sessions_counter = 0
 active_sessions_lock = asyncio.Lock()
 
 
-
 # ---------------------------------------------------------------------
-# LLM BACKLOG (RAM + FILE)
+# Observation buffer (RAM + spill-to-disk)
 # ---------------------------------------------------------------------
 
-class LLMBacklog:
+class ObservationBuffer:
     def __init__(self, session_id: str, ram_max: int = 100, max_pending: int = 500):
         self.session_id = session_id
         self.queue = asyncio.Queue(maxsize=ram_max)
@@ -84,7 +72,6 @@ class LLMBacklog:
     async def pending_count(self) -> int:
         return self.queue.qsize() + self.file_count
 
-
     async def put(self, summary: Dict[str, Any]):
         item = {
             "ts": time.time(),
@@ -92,9 +79,10 @@ class LLMBacklog:
             "summary": summary,
         }
 
-        # --- BACKPRESSURE: ждём, если backlog переполнен ---
-        while await self.pending_count() >= self.max_pending:
-            await asyncio.sleep(0.2)
+        # --- BACKPRESSURE: wait if the backlog is full ---
+        if await self.pending_count() >= self.max_pending:
+            LLM_BACKLOG_SIZE.labels(session_id=self.session_id).set(self.max_pending)
+            return
 
         try:
             self.queue.put_nowait(item)
@@ -104,8 +92,6 @@ class LLMBacklog:
             ).set(self.queue.qsize())
 
             return
-
-
 
 
         except asyncio.QueueFull:
@@ -118,7 +104,6 @@ class LLMBacklog:
         LLM_BACKLOG_SIZE.labels(
             session_id=self.session_id
         ).set(self.queue.qsize() + self.file_count)
-
 
     async def get(self) -> Optional[Dict[str, Any]]:
         try:
@@ -148,7 +133,6 @@ class LLMBacklog:
 
         return json.loads(first)
 
-
     async def requeue(self, item: Dict[str, Any]):
         async with self.file_lock:
             with self.file.open("a", encoding="utf-8") as f:
@@ -159,7 +143,6 @@ class LLMBacklog:
         LLM_BACKLOG_SIZE.labels(
             session_id=self.session_id
         ).set(self.queue.qsize() + self.file_count)
-
 
     async def cleanup(self):
 
@@ -196,19 +179,13 @@ class InferenceParams(BaseModel):
     # <<< CONFIGURABLE HISTORY LIMIT
     history_max_messages: Optional[int] = 20
 
+
 # ---------------------------------------------------------------------
 # Agent factory
 # ---------------------------------------------------------------------
 
 
-def create_agent(system_prompt: str, session_id: str):
-    history = ChatMessageHistory()
-
-    async def register_history():
-        async with memory_lock:
-            memory_store[session_id] = (history, time.time())
-
-    asyncio.create_task(register_history())
+def create_llm_scene_interpreter(system_prompt: str):
 
     llm = ChatOpenAI(
         model="gpt-4o-mini",
@@ -237,7 +214,7 @@ def create_agent(system_prompt: str, session_id: str):
       where X = min_events.object_events
       If X == 0, say exactly:
       "No objects were detected."
-      
+
     - ALWAYS use exactly this sentence for text:
       "Text was detected at least X times, text: "text1", "text2", "text3"."
       where X = min_events.ocr_events
@@ -262,9 +239,7 @@ def create_agent(system_prompt: str, session_id: str):
 
     chain: Runnable = prompt | llm
 
-    return chain, history
-
-
+    return chain
 
 
 def summarize_batch(batch):
@@ -292,7 +267,7 @@ def summarize_batch(batch):
                 # COCO class 0 = person
                 summary["min_events"]["person_events"] += 1
             else:
-                # любой НЕ человек
+                # NOT human
                 summary["min_events"]["object_events"] += 1
 
         # -------- POSE --------
@@ -318,12 +293,7 @@ def summarize_batch(batch):
     return summary
 
 
-
-
-
-
-async def llm_worker(agent, history, ws, backlog, session_id, params):
-
+async def scene_narrator_loop(llm_interpreter, ws, observation_buffer, session_id, params, ws_send_lock):
     while True:
         try:
             await asyncio.sleep(0)
@@ -337,16 +307,15 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
         if ws.client_state.name != "CONNECTED":
             break
 
-        item = await backlog.get()
+        try:
+            item = await asyncio.wait_for(observation_buffer.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
 
         if item is None:
             await asyncio.sleep(0.1)
             continue
 
-        # --- LIMIT CHAT HISTORY (SAFE) ---
-        if params.history_max_messages is not None:
-            if len(history.messages) > params.history_max_messages:
-                history.messages[:] = history.messages[-params.history_max_messages:]
 
         buffer = []
 
@@ -358,11 +327,9 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
                 if summary.get("motion_detected"):
                     parts.append("Motion was detected.")
 
-
                 pe = summary["min_events"]["person_events"]
                 if pe > 0:
                     parts.append(f"A person was detected at least {pe} times.")
-
 
                 oe = summary["min_events"]["object_events"]
                 if oe > 0:
@@ -370,16 +337,14 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
                 else:
                     parts.append("No objects were detected.")
 
-
                 po = summary["min_events"]["pose_events"]
                 if po > 0:
                     parts.append(f"A pose was detected at least {po} times.")
 
-
                 ocr = summary["min_events"].get("ocr_events", 0)
                 texts = summary.get("texts") or []
                 if ocr > 0 and texts:
-                    unique_texts = list(dict.fromkeys(texts))[:10]  # убрать дубликаты, лимит
+                    unique_texts = list(dict.fromkeys(texts))[:10]  # remove duplicates, limit
                     quoted = ", ".join(f"\"{t}\"" for t in unique_texts)
                     parts.append(
                         f"Text was detected at least {ocr} times, text: {quoted}."
@@ -387,14 +352,12 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
 
                 return " ".join(parts)
 
-
-            async for chunk in agent.astream(
-                {
-                    "input": build_summary_text(item["summary"]),
-                    "frames_count": item["summary"]["frames"]
-                }
+            async for chunk in llm_interpreter.astream(
+                    {
+                        "input": build_summary_text(item["summary"]),
+                        "frames_count": item["summary"]["frames"]
+                    }
             ):
-
 
                 if isinstance(chunk, AIMessageChunk):
                     if chunk.content:
@@ -409,10 +372,14 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
             )
 
             if final_text:
-                await ws.send_json({
-                    "type": "llm_summary",
-                    "data": final_text,
-                })
+                try:
+                    async with ws_send_lock:
+                        await ws.send_json({
+                            "type": "llm_summary",
+                            "data": final_text,
+                        })
+                except RuntimeError:
+                    break
 
 
         except Exception as e:
@@ -420,29 +387,26 @@ async def llm_worker(agent, history, ws, backlog, session_id, params):
                 "[LLM] STREAM FAILED session_id=%s",
                 session_id
             )
+            await asyncio.sleep(1.0)
             continue
-
-
 
 
 # ---------------------------------------------------------------------
 # Inference tool
 # ---------------------------------------------------------------------
 async def inference_tool(
-    params: Dict,
-    agent: Optional[RunnableWithMessageHistory],
-    session_id: str,
-    backlog: LLMBacklog,
-    frames_provider: Callable[[], Optional[np.ndarray]],  # ← ВАЖНО
+        params: Dict,
+        llm_interpreter: Optional[Runnable],
+        session_id: str,
+        observation_buffer: ObservationBuffer,
+        frames_provider: Callable[[], Optional[np.ndarray]],
 ) -> AsyncIterator[Dict]:
-
-
     llm_batch: List[Dict[str, Any]] = []
     llm_batch_size = 10
 
     frame_idx = 0
 
-    FPS_INTERVAL = 0.5  # секунды
+    FPS_INTERVAL = 0.5  # seconds
 
     fps_window_start = time.time()
     fps_window_frames = 0
@@ -472,7 +436,7 @@ async def inference_tool(
                     batch = result.get("batch", [])
                     batch_size = len(batch)
 
-                    cached_backlog_size = await backlog.pending_count()
+                    cached_backlog_size = await observation_buffer.pending_count()
 
                     if batch_size > 0:
                         fps_window_frames += batch_size
@@ -495,7 +459,7 @@ async def inference_tool(
                         frame_idx += 1
 
                         # -------- LLM LOGIC (Not blocking inference) --------
-                        if agent and params.get("use_langchain"):
+                        if llm_interpreter is not None and params.get("use_langchain"):
 
                             backlog_size = cached_backlog_size
 
@@ -515,7 +479,7 @@ async def inference_tool(
                                 last_llm_ts = time.time()
                                 llm_batch.append(frame_data)
 
-                                # summary 
+                                # summary
                                 if len(llm_batch) >= llm_batch_size:
                                     summary = summarize_batch(llm_batch)
                                     summary["frame_idx_range"] = {
@@ -527,7 +491,7 @@ async def inference_tool(
                                         pass
 
                                     wait_started = time.time()
-                                    while await backlog.pending_count() >= MAX_LLM_BACKLOG:
+                                    if await observation_buffer.pending_count() >= MAX_LLM_BACKLOG:
                                         if (
                                                 time.time() - wait_started
                                                 > BACKLOG_MAX_WAIT_SEC
@@ -535,12 +499,12 @@ async def inference_tool(
                                             logger.error(
                                                 f"LLM backlog stuck for session {session_id}"
                                             )
-                                            raise RuntimeError(
-                                                "LLM backlog overflow timeout"
-                                            )
-                                        await asyncio.sleep(BACKLOG_CHECK_INTERVAL)
+                                            break
 
-                                    await backlog.put(summary)
+                                        await asyncio.sleep(BACKLOG_CHECK_INTERVAL)
+                                        continue
+
+                                    await observation_buffer.put(summary)
                                     cached_backlog_size += 1
 
                                     llm_batch.clear()
@@ -570,7 +534,7 @@ async def inference_tool(
                 INFERENCE_REQUESTS.labels(status="finished").inc()
 
                 # Sending the last incomplete batch:
-                if agent and params.get("use_langchain") and llm_batch:
+                if llm_interpreter and params.get("use_langchain") and llm_batch:
                     summary = summarize_batch(llm_batch)
                     summary["frame_idx_range"] = {
                         "from": llm_batch[0].get("frame_idx"),
@@ -579,34 +543,21 @@ async def inference_tool(
 
                     wait_started = time.time()
 
-                    while await backlog.pending_count() >= MAX_LLM_BACKLOG:
+                    while await observation_buffer.pending_count() >= MAX_LLM_BACKLOG:
                         if time.time() - wait_started > BACKLOG_MAX_WAIT_SEC:
                             logger.error(
                                 f"LLM backlog stuck on final batch for session {session_id}"
                             )
-                            break 
+                            break
 
                         await asyncio.sleep(BACKLOG_CHECK_INTERVAL)
 
-                    await backlog.put(summary)
+                    await observation_buffer.put(summary)
                     llm_batch.clear()
-
-                async with memory_lock:
-                    memory_store.pop(session_id, None)
-
 
 # ---------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------
-
-async def memory_cleanup_task():
-    while True:
-        await asyncio.sleep(60)  # раз в минуту
-        now = time.time()
-        async with memory_lock:
-            for sid, (_, ts) in list(memory_store.items()):
-                if now - ts > MEMORY_TTL:
-                    memory_store.pop(sid, None)
 
 
 app = FastAPI(title="Multimodal Triton Inference API")
@@ -619,19 +570,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("shutdown")
 async def shutdown_triton():
     await close_triton_client()
 
 
-@app.on_event("startup")
-async def start_background_tasks():
-    asyncio.create_task(memory_cleanup_task())
-
-
 @app.websocket("/ws/inference")
 async def ws_inference(ws: WebSocket):
-
     global active_sessions_counter
 
     origin = ws.headers.get("origin")
@@ -639,18 +585,20 @@ async def ws_inference(ws: WebSocket):
 
     await ws.accept()
 
-    ACTIVE_SESSIONS.inc()
+    inference_started = False
+
+    ws_send_lock = asyncio.Lock()
 
     async def ws_heartbeat():
         try:
             while True:
                 await asyncio.sleep(5)
-                await ws.send_json({"type": "ping"})
+                async with ws_send_lock:
+                    await ws.send_json({"type": "ping"})
         except Exception:
             pass
 
     heartbeat_task = asyncio.create_task(ws_heartbeat())
-
 
     # --- receive init params from client ---
     init_msg = await ws.receive_json()
@@ -659,41 +607,42 @@ async def ws_inference(ws: WebSocket):
         await ws.close(code=1003)
         return
 
-    params = InferenceParams(**init_msg.get("params", {}))
+    ACTIVE_SESSIONS.inc()
 
+    params = InferenceParams(**init_msg.get("params", {}))
 
     async with active_sessions_lock:
         active_sessions_counter += 1
         current_active = active_sessions_counter
 
-    await ws.send_json({
-        "type": "queue_status",
-        "state": "waiting",
-        "active_sessions": current_active,
-    })
+    async with ws_send_lock:
+        await ws.send_json({
+            "type": "queue_status",
+            "state": "waiting",
+            "active_sessions": current_active,
+        })
 
     llm_task: Optional[asyncio.Task] = None
 
     # --- session / params ---
     session_id = uuid4().hex
-    backlog = LLMBacklog(session_id)
+    observation_buffer = ObservationBuffer(session_id)
 
-    agent: Optional[RunnableWithMessageHistory] = None
+    llm_interpreter: Optional[Runnable] = None
     if params.use_langchain:
-        agent, history = create_agent(
+        llm_interpreter = create_llm_scene_interpreter(
             system_prompt=params.system_prompt,
-            session_id=session_id
         )
 
-    if params.use_langchain and agent:
+    if params.use_langchain and llm_interpreter is not None:
         llm_task = asyncio.create_task(
-            llm_worker(
-                agent=agent,
-                history=history,
+            scene_narrator_loop(
+                llm_interpreter=llm_interpreter,
                 ws=ws,
-                backlog=backlog,
+                observation_buffer=observation_buffer,
                 session_id=session_id,
                 params=params,
+                ws_send_lock=ws_send_lock,
             )
         )
 
@@ -702,45 +651,68 @@ async def ws_inference(ws: WebSocket):
     inference_task: asyncio.Task | None = None
 
     async def frames_provider():
-        frame = await frame_queue.get()  
-        # logger.info("FRAMES_PROVIDER GOT FRAME")
-        return frame
-
+        try:
+            return await asyncio.wait_for(frame_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            return None
 
     async def inference_loop():
 
         # ---- ENTER GPU QUEUE ----
         try:
-            await ws.send_json({
-                "type": "queue_status",
-                "state": "running",
-                "active_sessions": active_sessions_counter,
-            })
+            async with ws_send_lock:
+                await ws.send_json({
+                    "type": "queue_status",
+                    "state": "running",
+                    "active_sessions": active_sessions_counter,
+                })
         except Exception:
             return
 
+        try:
+            async for result in inference_tool(
+                    params=params.dict(),
+                    llm_interpreter=llm_interpreter,
+                    session_id=session_id,
+                    observation_buffer=observation_buffer,
+                    frames_provider=frames_provider
+            ):
+                async with ws_send_lock:
+                    try:
+                        await ws.send_json(result)
+                    except RuntimeError:
+                        return
 
-        async for result in inference_tool(
-                params=params.dict(),
-                agent=agent,
-                session_id=session_id,
-                backlog=backlog,
-                frames_provider=frames_provider
-        ):
-            await ws.send_json(result)
+
+
+        except asyncio.CancelledError:
+            # NORMAL client termination
+            raise
+
+
+        except Exception:
+            # real error
+            logger.exception("Inference loop crashed")
+            return
 
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await ws.receive()
+            except RuntimeError:
+                break
 
             # ===== 1️⃣ BINARY FRAME =====
             if msg["type"] == "websocket.receive" and "bytes" in msg:
                 jpg_bytes = msg["bytes"]
 
-                img = cv2.imdecode(
-                    np.frombuffer(jpg_bytes, np.uint8),
-                    cv2.IMREAD_COLOR
-                )
+                def decode():
+                    arr = np.frombuffer(jpg_bytes, np.uint8)
+                    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+                loop = asyncio.get_running_loop()
+
+                img = await loop.run_in_executor(None, decode)
 
                 if img is None:
                     continue
@@ -758,15 +730,15 @@ async def ws_inference(ws: WebSocket):
             if "text" in msg:
                 data = json.loads(msg["text"])
 
-                if data["type"] == "start" and inference_task is None:
+                if data["type"] == "start" and not inference_started:
+                    inference_started = True
 
                     async def inference_entry():
-                        # Waiting first frame to not start 
-                        first_frame = await frame_queue.get()
-                        await frame_queue.put(first_frame)
-
-                        # ВАЖНО: inference_loop теперь ЖИВЁТ В ЭТОЙ TASK
-                        await inference_loop()
+                        nonlocal inference_started
+                        try:
+                            await inference_loop()
+                        finally:
+                            inference_started = False
 
                     inference_task = asyncio.create_task(inference_entry())
 
@@ -776,7 +748,7 @@ async def ws_inference(ws: WebSocket):
                         inference_task.cancel()
                         inference_task = None
 
-    
+
     except WebSocketDisconnect:
         if inference_task:
             inference_task.cancel()
@@ -787,41 +759,56 @@ async def ws_inference(ws: WebSocket):
             current_active = active_sessions_counter
 
         try:
-            await ws.send_json({
-                "type": "queue_status",
-                "state": "finished",
-                "active_sessions": current_active,
-            })
+            async with ws_send_lock:
+                await ws.send_json({
+                    "type": "queue_status",
+                    "state": "finished",
+                    "active_sessions": current_active,
+                })
         except Exception:
             pass
 
         if heartbeat_task:
             heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except:
+                pass
 
-        # 1️⃣ остановить inference
+        # 1️⃣ Stop inference
 
         if inference_task:
             inference_task.cancel()
+            try:
+                await inference_task
+            except asyncio.CancelledError:
+                pass
 
-        # 2️⃣ остановить LLM worker
+        await asyncio.sleep(0.1)
+
+        # 2️⃣ Stop LLM worker
         if llm_task:
-
+            llm_task.cancel()
             try:
                 await llm_task
             except asyncio.CancelledError:
                 logger.info("LLM task cancelled cleanly")
+                pass
 
-        # 3️⃣ удалить backlog (RAM + file)
+        # 3️⃣ Delete observation buffer (RAM + file)
 
-        await backlog.cleanup()
-
-        async with memory_lock:
-            memory_store.pop(session_id, None)
+        await observation_buffer.cleanup()
 
         logger.info(
             "[SESSION CLEANUP DONE] session_id=%s",
             session_id
         )
+
+        while not frame_queue.empty():
+            try:
+                frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         ACTIVE_SESSIONS.dec()
 
