@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+venv/
+.env
+.env.*
+
+# Docker
+*.log
+
+# ML / CV
+*.onnx
+*.engine
+*.plan
+*.pt
+*.pth
+*.ckpt
+
+# Triton runtime artifacts
+triton/model_repository/**/1/*.plan
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
